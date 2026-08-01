@@ -25,7 +25,9 @@ void onNetworkEvent(arduino_event_id_t event) {
       break;
     case ARDUINO_EVENT_ETH_GOT_IP:
       ethernetHasIp = true;
-      Serial.printf("[ETH] IP: %s\n", ETH.localIP().toString().c_str());
+      Serial.printf("[ETH] IP: %s, link: %u Mbps, %s duplex\n",
+                    ETH.localIP().toString().c_str(), ETH.linkSpeed(),
+                    ETH.fullDuplex() ? "full" : "half");
       break;
     case ARDUINO_EVENT_ETH_LOST_IP:
       ethernetHasIp = false;
@@ -99,7 +101,8 @@ void setup() {
 void loop() {
   // Todos os servicos de rede ficam neste unico contexto cooperativo.
   ArduinoOTA.handle();
-  relays.loop();
   services.loop(ethernetHasIp);
+  // Recuperacao/scan I2C somente depois dos servicos Ethernet prioritarios.
+  relays.loop();
   delay(1);
 }

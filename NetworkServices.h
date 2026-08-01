@@ -46,11 +46,14 @@ class NetworkServices {
   void handleRelaysPut();
   void handleConfigGet();
   void handleConfigPut();
+  void handleI2cGet();
+  void handleI2cScan();
   void handleNotFound();
   void handleReboot();
 
   void fillHealth(JsonObject root);
   void fillRelays(JsonObject root) const;
+  void fillI2cDiagnostics(JsonObject root) const;
   bool applyRelayDocument(JsonVariantConst root, String &error);
   bool applyConfigText(const String &body, String &error, bool &rebootRequired);
 

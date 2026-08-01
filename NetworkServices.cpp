@@ -71,6 +71,8 @@ void NetworkServices::setupHttp() {
   web_.on("/api/v1/relays", HTTP_PUT, [this]() { handleRelaysPut(); });
   web_.on("/api/v1/config", HTTP_GET, [this]() { handleConfigGet(); });
   web_.on("/api/v1/config", HTTP_PUT, [this]() { handleConfigPut(); });
+  web_.on("/api/v1/i2c", HTTP_GET, [this]() { handleI2cGet(); });
+  web_.on("/api/v1/i2c/scan", HTTP_POST, [this]() { handleI2cScan(); });
   web_.on("/api/v1/reboot", HTTP_POST, [this]() { handleReboot(); });
   web_.onNotFound([this]() { handleNotFound(); });
 }
@@ -147,6 +149,86 @@ void NetworkServices::handleRelaysGet() {
   doc["ok"] = true;
   fillRelays(doc["relays"].to<JsonObject>());
   sendJson(200, doc);
+}
+
+void NetworkServices::fillI2cDiagnostics(JsonObject root) const {
+  JsonObject bus = root["bus"].to<JsonObject>();
+  bus["sda_gpio"] = RelayController::I2C_SDA;
+  bus["scl_gpio"] = RelayController::I2C_SCL;
+  bus["frequency_hz"] = RelayController::I2C_FREQUENCY;
+  bus["timeout_ms"] = RelayController::I2C_TIMEOUT_MS;
+  bus["sda_level"] = relays_.sdaLevel() ? "HIGH" : "LOW";
+  bus["scl_level"] = relays_.sclLevel() ? "HIGH" : "LOW";
+  bus["stuck_low"] = !relays_.sdaLevel() || !relays_.sclLevel();
+
+  JsonObject expected = root["expected_device"].to<JsonObject>();
+  expected["name"] = "PCF8575";
+  expected["address"] = "0x20";
+  expected["ack"] = relays_.pcfHealthy();
+  expected["last_error_code"] = relays_.lastI2cError();
+  expected["last_error"] = relays_.lastI2cErrorText();
+  expected["last_transaction_us"] = relays_.lastTransactionDurationUs();
+  expected["last_success_ms"] = relays_.lastSuccessMs();
+  expected["last_failure_ms"] = relays_.lastFailureMs();
+  expected["write_errors"] = relays_.writeErrors();
+
+  JsonObject scan = root["scan"].to<JsonObject>();
+  scan["running"] = relays_.scanRunning();
+  scan["completed"] = relays_.scanCompleted();
+  scan["current_address"] = relays_.scanCurrentAddress();
+  scan["duration_ms"] = relays_.scanDurationMs();
+  scan["nack_count"] = relays_.scanNackCount();
+  scan["timeout_count"] = relays_.scanTimeoutCount();
+  scan["other_error_count"] = relays_.scanOtherErrorCount();
+  scan["results_truncated"] = relays_.scanResultsTruncated();
+  JsonArray found = scan["found_addresses"].to<JsonArray>();
+  bool expectedFound = false;
+  for (uint8_t i = 0; i < relays_.scanFoundCount(); ++i) {
+    const uint8_t address = relays_.scanFoundAddress(i);
+    char formatted[5];
+    snprintf(formatted, sizeof(formatted), "0x%02X", address);
+    found.add(formatted);
+    if (address == RelayController::PCF8575_ADDRESS) expectedFound = true;
+  }
+
+  if (!relays_.sdaLevel() || !relays_.sclLevel()) {
+    root["diagnosis"] = "barramento preso em LOW: verifique curto, nivel logico, pull-ups e alimentacao";
+  } else if (relays_.pcfHealthy()) {
+    root["diagnosis"] = "PCF8575 respondeu e aceitou escrita";
+  } else if (relays_.scanRunning()) {
+    root["diagnosis"] = "scan I2C em andamento sem bloquear a rede";
+  } else if (relays_.scanCompleted() && relays_.scanTimeoutCount() > 0) {
+    root["diagnosis"] = "houve timeout I2C; confira pull-ups, nivel de tensao, curto e integridade de SDA/SCL";
+  } else if (relays_.scanCompleted() && relays_.scanOtherErrorCount() > 0) {
+    root["diagnosis"] = "o controlador registrou erros I2C diferentes de NACK; confira fiacao e alimentacao";
+  } else if (relays_.scanCompleted() && expectedFound) {
+    root["diagnosis"] = "0x20 foi encontrado no scan, mas a ultima escrita falhou";
+  } else if (relays_.scanCompleted() && relays_.scanFoundCount() > 0) {
+    root["diagnosis"] = "existem dispositivos I2C, mas o PCF8575 nao respondeu em 0x20; confira A0/A1/A2";
+  } else if (relays_.scanCompleted()) {
+    root["diagnosis"] = "nenhum dispositivo respondeu; confira VCC, GND, SDA, SCL e nivel de pull-up";
+  } else {
+    root["diagnosis"] = "PCF8575 sem ACK; execute POST /api/v1/i2c/scan";
+  }
+}
+
+void NetworkServices::handleI2cGet() {
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["note"] = "leitura instantanea do cache; este GET nao acessa nem bloqueia o I2C";
+  fillI2cDiagnostics(doc["i2c"].to<JsonObject>());
+  sendJson(200, doc);
+}
+
+void NetworkServices::handleI2cScan() {
+  const bool started = relays_.requestI2cScan();
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["started"] = started;
+  doc["message"] = started ? "scan iniciado; consulte GET /api/v1/i2c"
+                            : "scan ja estava em andamento";
+  fillI2cDiagnostics(doc["i2c"].to<JsonObject>());
+  sendJson(202, doc);
 }
 
 bool NetworkServices::applyRelayDocument(JsonVariantConst root, String &error) {

@@ -242,6 +242,71 @@ mbpoll -m tcp -a 1 -r 1 -t 0 -1 192.168.1.50 1
 Leia 16 coils conforme a sintaxe da ferramenta Modbus usada. Algumas ferramentas
 mostram endereços começando em 1, embora o valor enviado no protocolo comece em 0.
 
+## Diagnosticar o I²C
+
+Este GET é imediato: não transmite no barramento e não atrasa Ethernet/OTA.
+
+```bash
+curl http://192.168.1.50/api/v1/i2c
+```
+
+```json
+{
+  "ok": true,
+  "note": "leitura instantanea do cache; este GET nao acessa nem bloqueia o I2C",
+  "i2c": {
+    "bus": {
+      "sda_gpio": 33,
+      "scl_gpio": 32,
+      "frequency_hz": 100000,
+      "timeout_ms": 5,
+      "sda_level": "HIGH",
+      "scl_level": "HIGH",
+      "stuck_low": false
+    },
+    "expected_device": {
+      "name": "PCF8575",
+      "address": "0x20",
+      "ack": false,
+      "last_error_code": 2,
+      "last_error": "NACK no endereco",
+      "last_transaction_us": 210,
+      "write_errors": 8
+    },
+    "scan": {
+      "running": false,
+      "completed": false,
+      "current_address": 0,
+      "duration_ms": 0,
+      "nack_count": 0,
+      "timeout_count": 0,
+      "other_error_count": 0,
+      "found_addresses": []
+    },
+    "diagnosis": "PCF8575 sem ACK; execute POST /api/v1/i2c/scan"
+  }
+}
+```
+
+Inicie a busca completa:
+
+```bash
+curl -X POST http://192.168.1.50/api/v1/i2c/scan
+```
+
+Em seguida consulte novamente `GET /api/v1/i2c`. O firmware verifica um endereço
+por passagem do loop; assim, mesmo com SDA/SCL defeituosos, uma única tentativa
+fica limitada a 5 ms e os serviços Ethernet continuam prioritários.
+
+Interpretação:
+
+- `SDA` ou `SCL` em LOW: curto, dispositivo prendendo a linha ou pull-up errado;
+- 126 NACKs e nenhum endereço: barramento livre, mas nenhum dispositivo alimentado
+  e endereçado respondeu;
+- `0x21`…`0x27` encontrado: A0/A1/A2 não estão na condição esperada para `0x20`;
+- timeouts: verifique nível lógico, pull-ups, solda, ruído e alimentação;
+- `0x20` encontrado mas escrita falha: conexão intermitente ou PCF8575 defeituoso.
+
 ## MQTT: comandos e respostas
 
 Com a configuração padrão e device name padrão:

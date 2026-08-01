@@ -89,6 +89,8 @@ Base: `http://IP_DO_EQUIPAMENTO/api/v1`
 | `PUT` | `/relays` | Comanda máscara ou todos os estados |
 | `GET` | `/config` | Configuração; senha MQTT vem mascarada |
 | `PUT` | `/config` | Atualização parcial persistente |
+| `GET` | `/i2c` | Diagnóstico instantâneo, sem acessar o barramento |
+| `POST` | `/i2c/scan` | Inicia scan I²C incremental e não bloqueante |
 | `POST` | `/reboot` | Reinicia o ESP32 após 500 ms |
 
 Os exemplos completos de payloads e respostas estão em
@@ -148,7 +150,10 @@ o processamento; a porta é totalmente recriada no próximo reboot.
 - Várias escritas Modbus são consolidadas antes da publicação MQTT de status.
 - O controle do PCF8575 não depende de MQTT, REST ou Modbus estarem conectados.
 - Em falha I²C, o estado solicitado é preservado e a escrita é repetida a cada
-  segundo; a API responde `503` e o health muda para `degraded`.
+  segundo com timeout de 5 ms; a API responde `503` e o health muda para
+  `degraded`.
+- O scan I²C testa somente um endereço por passagem do loop. OTA e serviços de
+  rede são atendidos antes de qualquer tentativa I²C.
 - Os relés não são restaurados ligados após reboot: o padrão industrial adotado
   nesta fase é sempre iniciar todos desligados.
 
@@ -167,6 +172,24 @@ Antes de energizar cargas reais:
 4. mantenha I²C curto e separado de cabos de potência;
 5. valide perda/retorno do cabo, broker fora do ar, múltiplos comandos e OTA;
 6. defina intertravamentos externos para cargas que não podem ligar juntas.
+
+## Diagnóstico de boot e Ethernet da ETH01
+
+O log `boot:0x3 (DOWNLOAD_BOOT...)` seguido por `waiting for download` não é
+falha de DHCP nem do firmware: significa que GPIO0 foi amostrado em LOW no reset.
+Na WT32-ETH01 o GPIO0 também recebe o clock RMII externo de 50 MHz e o GPIO16
+habilita esse oscilador. Se o problema for intermitente, verifique a alimentação,
+o circuito de enable do oscilador e se GPIO16 possui polarização definida durante
+o boot. Nenhum outro periférico deve usar GPIO0 ou GPIO16.
+
+Uma solução de hardware normalmente usada é manter o enable do oscilador em LOW
+durante o reset e permitir que `ETH.begin()` o coloque em HIGH depois do boot. Só
+adicione um pull-down externo após conferir o esquema exato da revisão da placa.
+
+Eventos repetidos `cabo conectado`/`cabo desconectado` indicam perda do link
+físico ou do clock RMII. Teste fonte, cabo, porta do switch e tensão/clock do PHY.
+Depois que o link ficou estável, DHCP levou aproximadamente um segundo no log de
+referência; portanto o atraso anterior ocorreu antes do DHCP.
 
 ## Organização do código
 
