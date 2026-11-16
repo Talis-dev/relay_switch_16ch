@@ -26,21 +26,6 @@ struct DeviceConfig {
   bool modbusEnabled;
   uint16_t modbusPort;
   uint8_t modbusUnitId;
-
-  uint8_t pcfAddress;
-  bool inputActiveLow;
-  uint16_t inputDebounceMs;
-  bool webhookEnabled;
-  char webhookUrl[257];
-  char webhookToken[129];
-  char webhookCa[2049];
-
-  bool apEnabled;
-  char apSsid[33];
-  char apPassword[64];
-  IPAddress apIp;
-  IPAddress apDns;
-  uint8_t apChannel;
 };
 
 class AppConfig {
@@ -51,7 +36,6 @@ class AppConfig {
   // Aplica um JSON parcial. Campos ausentes sao preservados.
   bool update(JsonVariantConst root, String &error, bool &rebootRequired);
   bool save();
-  void restore(const DeviceConfig &previous) { config_ = previous; }
   void toJson(JsonObject target, bool includeSecret = false) const;
 
  private:
