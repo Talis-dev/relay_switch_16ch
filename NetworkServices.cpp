@@ -2,12 +2,14 @@
 
 #include <ArduinoOTA.h>
 #include <ESP.h>
+#include "WebPage.h"
+#include "ApiDocsPage.h"
 
 namespace {
 constexpr uint16_t HTTP_PORT = 80;
 constexpr uint32_t MQTT_RECONNECT_INTERVAL_MS = 10000;
 constexpr uint32_t HEALTH_PUBLISH_INTERVAL_MS = 30000;
-constexpr size_t MQTT_BUFFER_SIZE = 2048;
+constexpr size_t MQTT_BUFFER_SIZE = 6144;
 
 bool parseOnValue(JsonVariantConst value, bool &on) {
   if (value.is<bool>()) {
@@ -40,6 +42,8 @@ NetworkServices::NetworkServices(AppConfig &config, RelayController &relays)
 }
 
 void NetworkServices::begin() {
+  gateway_.begin(config_.data());
+  webhook_.begin();
   setupHttp();
   web_.begin();
   configureMqtt();
@@ -48,8 +52,21 @@ void NetworkServices::begin() {
 }
 
 void NetworkServices::loop(bool ethernetHasIp) {
+  gateway_.loop(ethernetHasIp);
+  const uint8_t changes = relays_.takeInputChanges();
+  if (lastInputsValid_ != relays_.inputsValid()) inputsDirty_ = true;
+  lastInputsValid_ = relays_.inputsValid();
+  if (changes) {
+    inputsDirty_ = true;
+    for (uint8_t channel = 1; channel <= RelayController::INPUT_COUNT; ++channel) {
+      if (changes & (1U << (channel - 1)))
+        webhook_.enqueue(config_.data(), channel, relays_.input(channel), relays_.inputMask(),
+                         relays_.inputSequence(), relays_.inputChangedMs(channel));
+    }
+  }
   web_.handleClient();
   serviceMqtt(ethernetHasIp);
+  if (inputsDirty_) publishInputs();
   serviceModbus(ethernetHasIp);
 
   if (lastEthernetHasIp_ && !ethernetHasIp && mqtt_.connected()) {
@@ -60,11 +77,16 @@ void NetworkServices::loop(bool ethernetHasIp) {
 
 void NetworkServices::setupHttp() {
   web_.on("/", HTTP_GET, [this]() {
+    web_.send_P(200, "text/html; charset=utf-8", WEB_PAGE);
+  });
+  web_.on("/api/docs", HTTP_GET, [this]() {
+    web_.send_P(200, "text/html; charset=utf-8", API_DOCS_PAGE);
+  });
+  web_.on("/api/v1/inputs", HTTP_GET, [this]() {
     JsonDocument doc;
-    doc["name"] = "Relay Switch Industrial 16CH";
-    doc["api"] = "/api/v1";
-    doc["documentation"] = "README.md";
-    sendJson(200, doc);
+    doc["ok"] = relays_.inputsValid();
+    fillInputs(doc["inputs"].to<JsonObject>());
+    sendJson(relays_.inputsValid() ? 200 : 503, doc);
   });
   web_.on("/api/v1/health", HTTP_GET, [this]() { handleHealth(); });
   web_.on("/api/v1/relays", HTTP_GET, [this]() { handleRelaysGet(); });
@@ -80,6 +102,7 @@ void NetworkServices::setupHttp() {
 void NetworkServices::sendJson(int status, JsonDocument &document) {
   String response;
   serializeJson(document, response);
+  web_.sendHeader("Cache-Control", "no-store");
   web_.send(status, "application/json; charset=utf-8", response);
 }
 
@@ -92,7 +115,9 @@ void NetworkServices::sendError(int status, const String &message) {
 
 void NetworkServices::fillRelays(JsonObject root) const {
   root["mask"] = relays_.mask();
-  root["pcf8575_ok"] = relays_.pcfHealthy();
+  root["pcf8574_ok"] = relays_.pcfHealthy();
+  root["state_type"] = "commanded";
+  root["outputs_enabled"] = relays_.outputsEnabled();
   root["write_errors"] = relays_.writeErrors();
   JsonArray channels = root["channels"].to<JsonArray>();
   for (uint8_t channel = 1; channel <= RelayController::CHANNEL_COUNT; ++channel) {
@@ -118,9 +143,11 @@ void NetworkServices::fillHealth(JsonObject root) {
   ethernet["dhcp"] = config_.data().dhcp;
 
   JsonObject relay = root["relay_controller"].to<JsonObject>();
-  relay["pcf8575_ok"] = relays_.pcfHealthy();
+  relay["pcf8574_ok"] = relays_.pcfHealthy();
   relay["mask"] = relays_.mask();
   relay["write_errors"] = relays_.writeErrors();
+  relay["enable_gpio"] = RelayController::RELAY_ENABLE_GPIO;
+  relay["outputs_enabled"] = relays_.outputsEnabled();
 
   JsonObject mqtt = root["mqtt"].to<JsonObject>();
   mqtt["enabled"] = config_.data().mqttEnabled;
@@ -135,6 +162,9 @@ void NetworkServices::fillHealth(JsonObject root) {
   modbus["configured_port"] = config_.data().modbusPort;
   modbus["active_port"] = activeModbusPort_;
   modbus["unit_id"] = config_.data().modbusUnitId;
+  fillInputs(root["inputs"].to<JsonObject>());
+  gateway_.toJson(root["wifi_ap"].to<JsonObject>());
+  webhook_.toJson(root["webhook"].to<JsonObject>());
 }
 
 void NetworkServices::handleHealth() {
@@ -142,6 +172,30 @@ void NetworkServices::handleHealth() {
   doc["ok"] = true;
   fillHealth(doc["health"].to<JsonObject>());
   sendJson(200, doc);
+}
+
+void NetworkServices::fillInputs(JsonObject root) const {
+  root["valid"] = relays_.inputsValid();
+  root["mask"] = relays_.inputMask();
+  root["sequence"] = relays_.inputSequence();
+  root["sample_ms"] = relays_.inputSampleMs();
+  JsonArray channels = root["channels"].to<JsonArray>();
+  for (uint8_t i = 1; i <= RelayController::INPUT_COUNT; ++i) {
+    JsonObject item = channels.add<JsonObject>();
+    item["channel"] = i;
+    item["active"] = relays_.input(i);
+    item["changed_ms"] = relays_.inputChangedMs(i);
+  }
+}
+
+void NetworkServices::publishInputs() {
+  if (!mqtt_.connected()) return;
+  JsonDocument doc;
+  fillInputs(doc.to<JsonObject>());
+  String payload;
+  serializeJson(doc, payload);
+  if (mqtt_.publish((mqttPrefix() + "/inputs/state").c_str(), payload.c_str(), true))
+    inputsDirty_ = false;
 }
 
 void NetworkServices::handleRelaysGet() {
@@ -162,8 +216,10 @@ void NetworkServices::fillI2cDiagnostics(JsonObject root) const {
   bus["stuck_low"] = !relays_.sdaLevel() || !relays_.sclLevel();
 
   JsonObject expected = root["expected_device"].to<JsonObject>();
-  expected["name"] = "PCF8575";
-  expected["address"] = "0x20";
+  expected["name"] = "PCF8574";
+  char addressText[5];
+  snprintf(addressText, sizeof(addressText), "0x%02X", relays_.address());
+  expected["address"] = addressText;
   expected["ack"] = relays_.pcfHealthy();
   expected["last_error_code"] = relays_.lastI2cError();
   expected["last_error"] = relays_.lastI2cErrorText();
@@ -188,13 +244,13 @@ void NetworkServices::fillI2cDiagnostics(JsonObject root) const {
     char formatted[5];
     snprintf(formatted, sizeof(formatted), "0x%02X", address);
     found.add(formatted);
-    if (address == RelayController::PCF8575_ADDRESS) expectedFound = true;
+    if (address == relays_.address()) expectedFound = true;
   }
 
   if (!relays_.sdaLevel() || !relays_.sclLevel()) {
     root["diagnosis"] = "barramento preso em LOW: verifique curto, nivel logico, pull-ups e alimentacao";
   } else if (relays_.pcfHealthy()) {
-    root["diagnosis"] = "PCF8575 respondeu e aceitou escrita";
+    root["diagnosis"] = "PCF8574 respondeu e aceitou escrita";
   } else if (relays_.scanRunning()) {
     root["diagnosis"] = "scan I2C em andamento sem bloquear a rede";
   } else if (relays_.scanCompleted() && relays_.scanTimeoutCount() > 0) {
@@ -202,13 +258,13 @@ void NetworkServices::fillI2cDiagnostics(JsonObject root) const {
   } else if (relays_.scanCompleted() && relays_.scanOtherErrorCount() > 0) {
     root["diagnosis"] = "o controlador registrou erros I2C diferentes de NACK; confira fiacao e alimentacao";
   } else if (relays_.scanCompleted() && expectedFound) {
-    root["diagnosis"] = "0x20 foi encontrado no scan, mas a ultima escrita falhou";
+    root["diagnosis"] = "o endereco configurado foi encontrado no scan, mas a ultima escrita falhou";
   } else if (relays_.scanCompleted() && relays_.scanFoundCount() > 0) {
-    root["diagnosis"] = "existem dispositivos I2C, mas o PCF8575 nao respondeu em 0x20; confira A0/A1/A2";
+    root["diagnosis"] = "existem dispositivos I2C, mas o PCF8574 nao respondeu no endereco configurado; confira A0/A1/A2";
   } else if (relays_.scanCompleted()) {
     root["diagnosis"] = "nenhum dispositivo respondeu; confira VCC, GND, SDA, SCL e nivel de pull-up";
   } else {
-    root["diagnosis"] = "PCF8575 sem ACK; execute POST /api/v1/i2c/scan";
+    root["diagnosis"] = "PCF8574 sem ACK; execute POST /api/v1/i2c/scan";
   }
 }
 
@@ -239,7 +295,9 @@ bool NetworkServices::applyRelayDocument(JsonVariantConst root, String &error) {
 
   if (!root["mask"].isNull()) {
     const uint32_t mask = root["mask"].as<uint32_t>();
-    if (mask > 0xFFFFU) { error = "mask deve estar entre 0 e 65535"; return false; }
+    if (!root["mask"].is<uint32_t>() || mask > RelayController::OUTPUT_MASK) {
+      error = "mask deve estar entre 0 e 31"; return false;
+    }
     relays_.setMask(static_cast<uint16_t>(mask));
     syncModbusCoils();
     return true;
@@ -248,7 +306,7 @@ bool NetworkServices::applyRelayDocument(JsonVariantConst root, String &error) {
   JsonArrayConst states = root["states"];
   if (!states.isNull()) {
     if (states.size() != RelayController::CHANNEL_COUNT) {
-      error = "states deve conter exatamente 16 valores booleanos";
+      error = "states deve conter exatamente 5 valores booleanos";
       return false;
     }
     uint16_t mask = 0;
@@ -277,7 +335,7 @@ void NetworkServices::handleRelaysPut() {
   JsonDocument response;
   response["ok"] = relays_.pcfHealthy();
   fillRelays(response["relays"].to<JsonObject>());
-  if (!relays_.pcfHealthy()) response["warning"] = "estado solicitado, mas PCF8575 nao confirmou escrita I2C";
+  if (!relays_.pcfHealthy()) response["warning"] = "estado solicitado, mas PCF8574 nao confirmou escrita I2C";
   sendJson(relays_.pcfHealthy() ? 200 : 503, response);
 }
 
@@ -295,7 +353,7 @@ bool NetworkServices::applyConfigText(const String &body, String &error, bool &r
 
   const DeviceConfig previous = config_.data();
   if (!config_.update(input.as<JsonVariantConst>(), error, rebootRequired)) return false;
-  if (!config_.save()) { error = "falha ao gravar configuracao na NVS"; return false; }
+  if (!config_.save()) { config_.restore(previous); error = "falha ao gravar configuracao na NVS"; return false; }
 
   const DeviceConfig &current = config_.data();
   const bool mqttChanged = previous.mqttEnabled != current.mqttEnabled ||
@@ -327,6 +385,7 @@ void NetworkServices::handleConfigPut() {
 }
 
 void NetworkServices::handleReboot() {
+  relays_.shutdown();
   JsonDocument doc;
   doc["ok"] = true;
   doc["message"] = "reiniciando em 500 ms";
@@ -344,7 +403,7 @@ void NetworkServices::handleNotFound() {
     }
     const int channel = channelText.toInt();
     if (channel < 1 || channel > RelayController::CHANNEL_COUNT) {
-      sendError(422, "canal deve estar entre 1 e 16");
+      sendError(422, "canal deve estar entre 1 e 5");
       return;
     }
     JsonDocument input;
@@ -361,7 +420,7 @@ void NetworkServices::handleNotFound() {
     response["channel"] = channel;
     response["on"] = on;
     response["mask"] = relays_.mask();
-    if (!relays_.pcfHealthy()) response["warning"] = "PCF8575 sem resposta I2C";
+    if (!relays_.pcfHealthy()) response["warning"] = "PCF8574 sem resposta I2C";
     sendJson(relays_.pcfHealthy() ? 200 : 503, response);
     return;
   }
@@ -427,6 +486,7 @@ void NetworkServices::connectMqtt() {
   mqtt_.subscribe((prefix + "/config/get").c_str(), 0);
   publishAvailability(true);
   publishRelayState();
+  publishInputs();
   publishHealth();
   publishConfigStatus();
   Serial.println("[MQTT] conectado");
@@ -458,7 +518,9 @@ void NetworkServices::handleMqttMessage(const String &topic, const uint8_t *payl
   if (topic.startsWith(relayPrefix) && topic.endsWith("/set")) {
     const int suffixStart = relayPrefix.length();
     const int suffixEnd = topic.length() - 4;
-    const int channel = topic.substring(suffixStart, suffixEnd).toInt();
+    const String channelText = topic.substring(suffixStart, suffixEnd);
+    if (channelText.length() != 1 || channelText[0] < '1' || channelText[0] > '5') return;
+    const int channel = channelText.toInt();
     bool on = false;
     JsonDocument input;
     const DeserializationError parseError = deserializeJson(input, body);

@@ -9,6 +9,8 @@
 
 #include "AppConfig.h"
 #include "RelayController.h"
+#include "InputWebhook.h"
+#include "WifiGateway.h"
 
 class NetworkServices {
  public:
@@ -23,6 +25,10 @@ class NetworkServices {
   NetworkClient mqttSocket_;
   PubSubClient mqtt_;
   ModbusIP modbus_;
+  InputWebhook webhook_;
+  WifiGateway gateway_;
+  bool inputsDirty_ = true;
+  bool lastInputsValid_ = false;
 
   bool lastEthernetHasIp_ = false;
   bool modbusServerStarted_ = false;
@@ -42,6 +48,8 @@ class NetworkServices {
   void sendJson(int status, JsonDocument &document);
   void sendError(int status, const String &message);
   void handleHealth();
+  void fillInputs(JsonObject root) const;
+  void publishInputs();
   void handleRelaysGet();
   void handleRelaysPut();
   void handleConfigGet();

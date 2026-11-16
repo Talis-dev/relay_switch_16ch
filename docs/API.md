@@ -1,372 +1,161 @@
-# Contratos REST e MQTT
+# API — Relay Switch 5CH + 2DI
 
-Substitua `192.168.1.50` pelo IP mostrado no monitor serial ou pelo IP fixo
-configurado.
+Base: `http://IP_DO_ESP/api/v1`. JSON UTF-8, sem autenticação; uso em rede confiável.
 
-## Health check
+Esta documentação também está disponível no próprio dispositivo em `/api/docs`,
+pelo link no painel inicial. Funciona sem internet. Os exemplos abaixo usam o
+endereço do dispositivo que você está acessando quando abertos nessa página.
 
-```bash
-curl http://192.168.1.50/api/v1/health
+| Método | Rota | Função |
+|---|---|---|
+| GET | `/health` | Ethernet, MQTT, Modbus, Wi-Fi/NAT, entradas e webhook |
+| GET | `/relays` | Cinco saídas comandadas e diagnóstico I²C |
+| PUT | `/relays/1` … `/relays/5` | `{"on":true}` / `{"on":false}` |
+| PUT | `/relays` | `{"mask":31}` ou `{"states":[true,false,false,true,false]}` |
+| GET | `/inputs` | Estado das duas entradas, sem alterar saídas |
+| GET | `/config` | Configuração com segredos mascarados |
+| PUT | `/config` | Atualização parcial persistente |
+| GET | `/i2c` | Diagnóstico em cache |
+| POST | `/i2c/scan` | Scan incremental; resposta 202 |
+| POST | `/reboot` | Reinício após 500 ms; resposta 202 |
+
+Máscaras de saída: bit 0 = relé 1, bit 4 = relé 5, valores 0–31. Entradas: bit 0 = DI1/P5, bit 1 = DI2/P6, valores 0–3.
+
+## Exemplos de requisições
+
+Exemplos para terminal com curl (sintaxe de shell Linux/macOS):
+
+```sh
+# Consultar as duas entradas
+curl http://IP_DO_ESP/api/v1/inputs
+
+# Ligar somente o relé 1
+curl -X PUT http://IP_DO_ESP/api/v1/relays/1 -H 'Content-Type: application/json' -d '{"on":true}'
+
+# Desligar somente o relé 1
+curl -X PUT http://IP_DO_ESP/api/v1/relays/1 -H 'Content-Type: application/json' -d '{"on":false}'
+
+# Desligar os cinco relés
+curl -X PUT http://IP_DO_ESP/api/v1/relays -H 'Content-Type: application/json' -d '{"mask":0}'
+
+# Alterar somente o debounce; reiniciar para aplicar
+curl -X PUT http://IP_DO_ESP/api/v1/config -H 'Content-Type: application/json' -d '{"io":{"debounce_ms":80}}'
 ```
 
-Resposta resumida:
+GET faz consultas. Comandos dos relés usam PUT com JSON e `Content-Type: application/json`.
+
+`relays.outputs_enabled` e `health.relay_controller.outputs_enabled` informam a
+habilitação física GPIO4. Ela exige circuito EN ativo em HIGH na PCB e pull-down
+externo. Sem essa ligação, o bloqueio do firmware não impede fisicamente os relés.
+
+## Consultar entradas
 
 ```json
 {
   "ok": true,
-  "health": {
-    "status": "ok",
-    "device_name": "relay-switch-16ch",
-    "uptime_ms": 125400,
-    "free_heap": 251840,
-    "min_free_heap": 241120,
-    "ethernet": {
-      "link": true,
-      "ip": "192.168.1.50",
-      "mac": "AA:BB:CC:DD:EE:FF",
-      "speed_mbps": 100,
-      "full_duplex": true,
-      "dhcp": true
-    },
-    "relay_controller": {
-      "pcf8575_ok": true,
-      "mask": 0,
-      "write_errors": 0
-    },
-    "mqtt": {
-      "enabled": false,
-      "connected": false,
-      "state": -1,
-      "reconnects": 0,
-      "messages_received": 0
-    },
-    "modbus": {
-      "enabled": false,
-      "server_started": false,
-      "configured_port": 502,
-      "active_port": 0,
-      "unit_id": 1
-    }
-  }
-}
-```
-
-`status: degraded` indica falha na comunicação I²C com o PCF8575.
-
-## Ler todos os relés
-
-```bash
-curl http://192.168.1.50/api/v1/relays
-```
-
-```json
-{
-  "ok": true,
-  "relays": {
-    "mask": 5,
-    "pcf8575_ok": true,
-    "write_errors": 0,
+  "inputs": {
+    "valid": true,
+    "mask": 1,
+    "sequence": 7,
+    "sample_ms": 50200,
     "channels": [
-      {"channel": 1, "on": true},
-      {"channel": 2, "on": false},
-      {"channel": 3, "on": true}
+      {"channel": 1, "active": true, "changed_ms": 50150},
+      {"channel": 2, "active": false, "changed_ms": 0}
     ]
   }
 }
 ```
 
-O array real sempre contém os 16 canais. Na máscara, bit 0 é relé 1 e bit 15
-é relé 16.
+503 e `valid:false` indicam leitura inválida; não trate o cache como estado atual. Tempos em ms desde o boot, com wrap de 32 bits. Sequência incrementa por canal alterado e reinicia no boot.
 
-## Acionar um relé
+## Configurar
 
-```bash
-curl -X PUT http://192.168.1.50/api/v1/relays/4 \
-  -H "Content-Type: application/json" \
-  -d '{"on":true}'
-```
+PUT `/config`, campos ausentes preservados:
 
 ```json
 {
-  "ok": true,
-  "channel": 4,
-  "on": true,
-  "mask": 8
+  "device_name": "reles-painel-01",
+  "network": {
+    "dhcp": true,
+    "ip": "192.168.1.50",
+    "gateway": "192.168.1.1",
+    "subnet": "255.255.255.0",
+    "dns1": "192.168.1.1",
+    "dns2": "8.8.8.8"
+  },
+  "io": {"address": 32, "input_active_low": true, "debounce_ms": 50},
+  "mqtt": {
+    "enabled": false,
+    "host": "192.168.1.10",
+    "port": 1883,
+    "user": "",
+    "password": "",
+    "base_topic": "industrial/relay5",
+    "keep_alive": 30
+  },
+  "webhook": {
+    "enabled": true,
+    "url": "http://192.168.1.10/api/entradas",
+    "token": "token-do-servidor",
+    "ca_cert": ""
+  },
+  "wifi_ap": {
+    "enabled": true,
+    "ssid": "Display-Painel",
+    "password": "troque-esta-senha",
+    "ip": "192.168.4.1",
+    "dns": "192.168.1.1",
+    "channel": 6
+  },
+  "modbus": {"enabled": false, "port": 502, "unit_id": 1}
 }
 ```
 
-Para desligar, envie `{"on":false}`.
+Retorno: `ok`, `saved`, `reboot_required`, `config` com segredos mascarados. `********` preserva o segredo; string vazia apaga. HTTPS exige CA PEM. MQTT/webhook aplicam sem reboot; nome, Ethernet, Wi-Fi e I/O exigem reinício. O sinalizador indica mudanças nessa requisição, sem registrar todas as alterações pendentes de reinício. Endereço decimal: 32–39 para PCF8574, 56–63 para PCF8574A.
 
-## Acionar vários relés
+## Webhook
 
-Relés 1 e 3 ligados (`1 + 4 = 5`):
-
-```bash
-curl -X PUT http://192.168.1.50/api/v1/relays \
-  -H "Content-Type: application/json" \
-  -d '{"mask":5}'
-```
-
-Também é possível enviar exatamente 16 estados:
+POST JSON com `X-Event-ID` e, se configurado, `Authorization: Bearer TOKEN`:
 
 ```json
 {
-  "states": [
-    true, false, true, false,
-    false, false, false, false,
-    false, false, false, false,
-    false, false, false, false
-  ]
+  "event": "input.changed",
+  "device_name": "reles-painel-01",
+  "event_id": "reles-painel-01-a1b2c3d4-7-1",
+  "sequence": 7,
+  "channel": 1,
+  "active": true,
+  "mask": 1,
+  "changed_ms": 50150
 }
 ```
 
-## Consultar configuração
+ID inclui valor aleatório por boot, sequência e canal. Duas mudanças na mesma amostra podem compartilhar a sequência final, mas têm IDs diferentes. Retorne 2xx e deduplique por ID. Não há evento inicial no boot. Até três tentativas; 4xx terminais exceto 408/429. Fila volátil de oito eventos: perda possível em reinício, fila cheia ou falhas esgotadas. Eventos enfileirados mantêm destino/credenciais originais.
 
-```bash
-curl http://192.168.1.50/api/v1/config
-```
+`health.webhook.last_http_status`: HTTP positivo ou erro negativo HTTPClient; `-1000` sem Ethernet, `-1001` sem horário válido para TLS, `-1002` falha ao inicializar URL. Contadores `delivered`, `failed`, `dropped` desde o boot.
 
-```json
-{
-  "ok": true,
-  "config": {
-    "device_name": "relay-switch-16ch",
-    "network": {
-      "dhcp": true,
-      "ip": "192.168.1.50",
-      "gateway": "192.168.1.1",
-      "subnet": "255.255.255.0",
-      "dns1": "192.168.1.1",
-      "dns2": "8.8.8.8"
-    },
-    "mqtt": {
-      "enabled": false,
-      "host": "",
-      "port": 1883,
-      "user": "",
-      "password": "",
-      "base_topic": "industrial/relay16",
-      "keep_alive": 30
-    },
-    "modbus": {
-      "enabled": false,
-      "port": 502,
-      "unit_id": 1
-    }
-  }
-}
-```
+## Erros
 
-Quando existe senha MQTT gravada, o GET retorna `********`, nunca a senha.
+JSON malformado: 400 (configuração: 422). Canal, máscara ou valores inválidos: 422. Falha PCF8574: 503; a máscara comandada permanece em RAM e é reaplicada na recuperação. Não confirma os contatos físicos.
 
-## Configurar MQTT
+## MQTT e Modbus
 
-A atualização é parcial: campos omitidos permanecem como estavam.
+Prefixo MQTT padrão: `industrial/relay5/relay-switch-5ch`. Se o nome do dispositivo
+ou tópico base mudar, o prefixo muda também. MQTT precisa ser habilitado na configuração.
 
-```bash
-curl -X PUT http://192.168.1.50/api/v1/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "device_name":"relay-painel-01",
-    "mqtt":{
-      "enabled":true,
-      "host":"192.168.1.10",
-      "port":1883,
-      "user":"relay01",
-      "password":"trocar-esta-senha",
-      "base_topic":"fabrica/setor-a/relays",
-      "keep_alive":30
-    }
-  }'
-```
+| Tópico relativo ao prefixo | Direção e conteúdo |
+|---|---|
+| `relay/1/set` … `relay/5/set` | Comando: ON/OFF ou JSON `{"on":true}` |
+| `relays/set` | Comando: `{"mask":0}` (0–31) ou cinco `states` |
+| `relay/1/state` … `relay/5/state` | Estado comandado ON/OFF, retido |
+| `relays/state` | Cinco saídas e diagnóstico I²C, JSON retido |
+| `inputs/state` | Entradas, validade, máscara e sequência, JSON retido |
+| `availability` | online / LWT offline, retido |
+| `health` | Diagnóstico a cada 30 segundos |
+| `config/set` | Atualização parcial com o mesmo JSON de PUT /config |
+| `config/get` | Solicita publicação da configuração; payload ignorado |
+| `config/status` | Resultado/configuração com segredos mascarados, retido |
 
-```json
-{
-  "ok": true,
-  "saved": true,
-  "reboot_required": true,
-  "config": {
-    "device_name": "relay-painel-01"
-  }
-}
-```
-
-MQTT é reconfigurado sem reiniciar. A resposta pede reboot porque a alteração do
-`device_name` só muda completamente hostname e OTA depois da reinicialização.
-
-## Configurar IP estático
-
-Faça esta chamada enquanto ainda conhece o endereço DHCP atual:
-
-```bash
-curl -X PUT http://192.168.1.50/api/v1/config \
-  -H "Content-Type: application/json" \
-  -d '{
-    "network":{
-      "dhcp":false,
-      "ip":"192.168.10.50",
-      "gateway":"192.168.10.1",
-      "subnet":"255.255.255.0",
-      "dns1":"192.168.10.1",
-      "dns2":"8.8.8.8"
-    }
-  }'
-```
-
-Resposta: `reboot_required: true`. Em seguida:
-
-```bash
-curl -X POST http://192.168.1.50/api/v1/reboot
-```
-
-Após o reboot, use `192.168.10.50`. Para voltar ao DHCP, envie
-`{"network":{"dhcp":true}}` e reinicie.
-
-## Habilitar Modbus TCP
-
-```bash
-curl -X PUT http://192.168.1.50/api/v1/config \
-  -H "Content-Type: application/json" \
-  -d '{"modbus":{"enabled":true,"port":502,"unit_id":1}}'
-```
-
-Habilitar na porta já configurada começa o atendimento em tempo de execução.
-Trocar a porta retorna `reboot_required: true`.
-
-Exemplo com `mbpoll`, ligando o relé 1 (coil 00001):
-
-```bash
-mbpoll -m tcp -a 1 -r 1 -t 0 -1 192.168.1.50 1
-```
-
-Leia 16 coils conforme a sintaxe da ferramenta Modbus usada. Algumas ferramentas
-mostram endereços começando em 1, embora o valor enviado no protocolo comece em 0.
-
-## Diagnosticar o I²C
-
-Este GET é imediato: não transmite no barramento e não atrasa Ethernet/OTA.
-
-```bash
-curl http://192.168.1.50/api/v1/i2c
-```
-
-```json
-{
-  "ok": true,
-  "note": "leitura instantanea do cache; este GET nao acessa nem bloqueia o I2C",
-  "i2c": {
-    "bus": {
-      "sda_gpio": 33,
-      "scl_gpio": 32,
-      "frequency_hz": 100000,
-      "timeout_ms": 5,
-      "sda_level": "HIGH",
-      "scl_level": "HIGH",
-      "stuck_low": false
-    },
-    "expected_device": {
-      "name": "PCF8575",
-      "address": "0x20",
-      "ack": false,
-      "last_error_code": 2,
-      "last_error": "NACK no endereco",
-      "last_transaction_us": 210,
-      "write_errors": 8
-    },
-    "scan": {
-      "running": false,
-      "completed": false,
-      "current_address": 0,
-      "duration_ms": 0,
-      "nack_count": 0,
-      "timeout_count": 0,
-      "other_error_count": 0,
-      "found_addresses": []
-    },
-    "diagnosis": "PCF8575 sem ACK; execute POST /api/v1/i2c/scan"
-  }
-}
-```
-
-Inicie a busca completa:
-
-```bash
-curl -X POST http://192.168.1.50/api/v1/i2c/scan
-```
-
-Em seguida consulte novamente `GET /api/v1/i2c`. O firmware verifica um endereço
-por passagem do loop; assim, mesmo com SDA/SCL defeituosos, uma única tentativa
-fica limitada a 5 ms e os serviços Ethernet continuam prioritários.
-
-Interpretação:
-
-- `SDA` ou `SCL` em LOW: curto, dispositivo prendendo a linha ou pull-up errado;
-- 126 NACKs e nenhum endereço: barramento livre, mas nenhum dispositivo alimentado
-  e endereçado respondeu;
-- `0x21`…`0x27` encontrado: A0/A1/A2 não estão na condição esperada para `0x20`;
-- timeouts: verifique nível lógico, pull-ups, solda, ruído e alimentação;
-- `0x20` encontrado mas escrita falha: conexão intermitente ou PCF8575 defeituoso.
-
-## MQTT: comandos e respostas
-
-Com a configuração padrão e device name padrão:
-
-```bash
-mosquitto_sub -h 192.168.1.10 -t 'industrial/relay16/relay-switch-16ch/#' -v
-```
-
-Ligar relé 4:
-
-```bash
-mosquitto_pub -h 192.168.1.10 \
-  -t 'industrial/relay16/relay-switch-16ch/relay/4/set' \
-  -m 'ON' -q 1
-```
-
-Ou:
-
-```json
-{"on": true}
-```
-
-Ligar relés 1 e 3 e desligar os demais:
-
-```bash
-mosquitto_pub -h 192.168.1.10 \
-  -t 'industrial/relay16/relay-switch-16ch/relays/set' \
-  -m '{"mask":5}' -q 1
-```
-
-O dispositivo publica, de forma retida:
-
-```text
-industrial/relay16/relay-switch-16ch/relay/1/state ON
-industrial/relay16/relay-switch-16ch/relay/2/state OFF
-industrial/relay16/relay-switch-16ch/relays/state {"mask":5,...}
-```
-
-Configurar por MQTT usa o mesmo objeto parcial da API:
-
-```bash
-mosquitto_pub -h 192.168.1.10 \
-  -t 'industrial/relay16/relay-switch-16ch/config/set' \
-  -m '{"modbus":{"enabled":true,"port":502,"unit_id":1}}' -q 1
-```
-
-O resultado aparece em `config/status`, sempre com a senha mascarada.
-
-## Erros REST
-
-Formato padrão:
-
-```json
-{
-  "ok": false,
-  "error": "canal deve estar entre 1 e 16"
-}
-```
-
-- `400`: JSON malformado;
-- `404`: rota inexistente;
-- `422`: campo ou valor inválido;
-- `503`: comando aceito logicamente, porém o PCF8575 não respondeu no I²C.
+O estado atual das entradas é publicado após mudanças e reconexão MQTT; não há
+histórico das bordas durante desconexão. Modbus TCP opcional: coils `0..4` para
+relés 1–5. Unit ID é informativo; a biblioteca aceita qualquer Unit ID.
